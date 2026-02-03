@@ -45,6 +45,13 @@ class ProjectTask(models.Model):
                     "Please update either the task's project or the assigned sprint to ensure they match."
                 )
 
+            # Ensure deadline is not before sprint start
+            if sprint.start_date and task.date_deadline < sprint.start_date:
+                raise ValidationError(
+                    f'The task "{task.name}" deadline ({task.date_deadline}) is before the sprint start date ({sprint.start_date}).\n\n'
+                    "Please set a deadline within the sprint period."
+                )
+
             # Ensure task deadline does not exceed sprint end date
             if task.date_deadline and task.sprint_id.end_date and task.date_deadline > task.sprint_id.end_date:
                 raise ValidationError(

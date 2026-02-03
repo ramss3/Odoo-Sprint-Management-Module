@@ -29,4 +29,19 @@
       </xpath>
     </field>
   </record>
+
+  <!-- Ensure the project's name in the task editor is read only while editing a task inside the sprint-->
+  <record id="project_task_form_readonly_project_from_sprint" model="ir.ui.view">
+    <field name="name">project.task.form.readonly.project.from.sprint</field>
+    <field name="model">project.task</field>
+    <field name="inherit_id" ref="project.view_task_form2"/>
+    <field name="arch" type="xml">
+      <xpath expr="//form" position="inside">
+        <field name="from_sprint" invisible="1"/>
+      </xpath>
+      <xpath expr="//field[@name='project_id']" position="attributes">
+        <attribute name="attrs">{'readonly': [('from_sprint', '=', True)]}</attribute>
+      </xpath>
+    </field>
+  </record>
 </odoo>

@@ -1,4 +1,4 @@
-from odoo import models, fields, api
+from odoo import models, fields, api, _
 from odoo.exceptions import ValidationError
 from datetime import timedelta
 
@@ -62,17 +62,23 @@ class ProjectSprint(models.Model):
     )
 
     """
-        When the form opens, this method ensures the 'Selection' field 
+        When the task form opens, this method ensures the 'Selection' field 
         shows all tasks currently linked to the selected project.
     """
     def _compute_task_select_ids(self):
         for sprint in self:
             sprint.task_select_ids = sprint.task_ids
 
-    # assign sprint to selected tasks, and unassign from removed ones
-    def _inverse_task_select_ids(self):
+    """
+        This method runs when the user modifies task_select_ids in the UI.
 
+        When the user changes the selection, update the real task-sprint relationship
+        Odoo can call this for multiple records at once through the loop
+    """
+    def _inverse_task_select_ids(self):
+        
         for sprint in self:
+            # A project is required to be assigned if user is creating tasks
             if not sprint.project_id:
                 raise ValidationError("Please select a Project before adding tasks to the sprint.")
     
@@ -86,7 +92,10 @@ class ProjectSprint(models.Model):
             to_add.write({"sprint_id": sprint.id})
             to_remove.write({"sprint_id": False})
 
-    # Prevent chaning project once spring has tasks or once sprint is not planned
+    """
+        Verifies if the tasks being assigned to the sprint are contained in the selected sprint's project
+        If not, sends a validation error
+    """
     @api.constrains("project_id", "task_ids", "state")
     def _check_tasks_match_project(self):
         for sprint in self:
@@ -95,20 +104,27 @@ class ProjectSprint(models.Model):
                 if mismatched:
                     raise ValidationError("All tasks in the sprint must belong to the assigned project in the same sprint.")
 
-    # Sprint duration rules
+    """
+        Sprint duration rules: Setting a fixed length of two weeks (14 days) for each sprint
+    """
     @api.onchange("start_date")
     def _onchange_start_date_set_default_end(self):
-        # setting the default sprint duration to 14 days (2 weeks period)
         for sprint in self:
-            if sprint.start_date and not sprint.end_date:
+            # Auto fill end date on first set or keep it synced if still auto-managed
+            if sprint.start_date:
                 sprint.end_date = sprint.start_date + timedelta(days=14)
     
-    # State updates immediately after dates are changed when in state_mode auto
+    """
+        Sprint State updates immediately after dates are changed when in state_mode auto
+    """
     @api.onchange("start_date", "end_date", "state_mode", "state_manual")
     def _onchange_recompute_state(self):
         for sprint in self:
             sprint._compute_state()
     
+    """
+        Ensure duration of the sprint does not exceed 28 days
+    """
     @api.constrains("start_date", "end_date")
     def _check_duration_and_order(self):
         # Start must be <= End and sprint duration must be at most 4 weeks (28 days)
@@ -121,7 +137,9 @@ class ProjectSprint(models.Model):
                 if duration_days > 28:
                     raise ValidationError("Sprint duration cannot exceed 4 weeks (28 days).")
                 
-    # auto assign sprint state according to the start and end date defined while creating the sprint    
+    """
+        auto modifies sprint state according to the start and end date set by the user    
+    """
     @api.depends("start_date", "end_date", "state_mode", "state_manual")
     def _compute_state(self):
         today = fields.Date.context_today(self)
@@ -141,8 +159,27 @@ class ProjectSprint(models.Model):
                 # fallback if dates incomplete
                 sprint.state = "planned"
     
-    # Past date rule for attemps to assigning sprints as planned/active with end dates prior to today
-    # Verificar se aqui é necessario validar a start date uma vez que so a end date interessa para a constrain
+    """
+        Daily cron to keep stored state in sync with today's date
+    """
+    @api.model
+    def cron_update_sprint_states(self):
+        today = fields.Date.context_today(self)
+
+        sprints = self.search([
+            ("state_mode", "=", "auto"),
+            ("start_date", "!=", False),
+            ("end_date", "!=", False),
+            ("state", "!=", "done")
+        ])
+
+        if sprints:
+            sprints._compute_state()
+    
+    """ 
+        Past date rule for attemps to assigning sprints as planned/active with end dates prior to today
+        Verificar se aqui é necessario validar a start date uma vez que so a end date interessa para a constrain 
+    """
     @api.constrains("start_date", "end_date", "state_mode", "state_manual")
     def _check_no_invalid_past_planned_active_sprint(self):
         today = fields.Date.context_today(self)
@@ -153,20 +190,33 @@ class ProjectSprint(models.Model):
             if sprint.state_mode == "manual" and sprint.end_date < today and sprint.state_manual in ("planned", "active"):
                 raise ValidationError("A sprint whose end date is in the past cannot be set to Planned or Active.")
     
-    # One active sprint per project
-    @api.constrains("state", "project_id")
-    def _check_if_project_already_has_active_sprint(self):
+    """
+        Ensures no sprint assigned to the same project overlaps other by any means
+    """
+    @api.constrains("project_id", "start_date", "end_date")
+    def _check_no_overlap_sprints(self):
         for sprint in self:
-            if sprint.state == "active":
-                other_active = self.search_count([
-                    ("project_id", "=", sprint.project_id.id),
-                    ("state", "=", "active"),
-                    ("id", "!=", sprint.id)
-                ])
-                if other_active:
-                    raise ValidationError("Only one active sprint is allowed per project.")
+            if not sprint.project_id or not sprint.start_date or not sprint.end_date:
+                continue
+
+            overlapping = self.search([
+                ("project_id", "=", sprint.project_id.id),
+                ("id", "!=", sprint.id),
+                ("start_date", "<=", sprint.end_date),
+                ("end_date", ">=", sprint.start_date),
+            ], limit=1)
+
+            if overlapping:
+                raise ValidationError(_(
+                    "This sprint (%(s)s → %(e)s) overlaps with '%(name)s' (%(os)s → %(oe)s). "
+                    "Sprints in the same project cannot overlap.",
+                    s=sprint.start_date, e=sprint.end_date,
+                    name=overlapping.display_name, os=overlapping.start_date, oe=overlapping.end_date
+                ))
                 
-    # Button actions (manual override)
+    """
+        Button actions to manually override the state of the sprint
+    """
     def action_set_auto(self):
         self.write({"state_mode": "auto"})
         self._compute_state()

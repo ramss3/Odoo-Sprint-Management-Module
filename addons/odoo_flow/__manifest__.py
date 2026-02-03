@@ -5,6 +5,7 @@
     "summary": "Add sprint management to projects and tasks",
     "depends": ["project"],
     "data": [
+        "data/sprint_cron.xml",
         "security/ir.model.access.csv",
         "views/sprint_views.xml",
         "views/project_task_views.xml",

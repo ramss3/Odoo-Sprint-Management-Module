@@ -29,6 +29,7 @@ class ProjectTask(models.Model):
             name = (task.name or "").strip()
             if not name or not task.sprint_id:
                 continue
+            
 
             duplicates_in_sprint = [
                 ("name", "=", name),

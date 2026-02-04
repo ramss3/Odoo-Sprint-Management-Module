@@ -7,6 +7,11 @@ class ProjectSprint(models.Model):
     _description = "Project Sprint"
     _order = "end_date desc, id desc"
 
+    # ---- Constants ----
+    DEFAULT_SPRINT_DAYS = 14
+    MAX_SPRINT_DAYS = 28
+
+    # --- Sprint fields ---
     name = fields.Char(required=True)
 
     project_id = fields.Many2one(
@@ -18,7 +23,12 @@ class ProjectSprint(models.Model):
     start_date = fields.Date(required=True)
     end_date = fields.Date(required=True)
 
-    # State mode: default auto. Manual is allowed via buttons
+    # “Intent” flag: False until user deviates from default end date
+    end_date_manual = fields.Boolean(default=False)
+
+    has_tasks = fields.Boolean(compute="_compute_has_tasks", store=True)
+
+    # State mode: default auto. Manual is allowed through UI buttons
     state_mode = fields.Selection(
         [("auto", "Auto"), ("manual", "Manual")],
         default="auto",
@@ -61,27 +71,107 @@ class ProjectSprint(models.Model):
         inverse="_inverse_task_select_ids",
     )
 
-    """
-        When the task form opens, this method ensures the 'Selection' field 
-        shows all tasks currently linked to the selected project.
-    """
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+    
+    """Accepts datetime.date or 'YYYY-MM-DD' string; returns datetime.date or False."""
+    def _to_date(self, value):
+        if not value:
+            return False
+        return fields.Date.from_string(value) if isinstance(value, str) else value
+
+    """start_date is datetime.date -> returns end time for the default sprint length"""
+    def _default_end_date(self, start_date):
+        return start_date + timedelta(days=self.DEFAULT_SPRINT_DAYS)
+
+    # start is date or string -> returns 'YYYY-MM-DD'
+    def _default_end_str(self, start):
+        start_dt = self._to_date(start)
+        return fields.Date.to_string(self._default_end_date(start_dt))
+
+    # Project can't change once sprint has tasks or is active/done
+    def _enforce_project_lock(self, vals):
+        
+        if "project_id" not in vals:
+            return
+
+        for sprint in self:
+            if sprint.has_tasks:
+                raise ValidationError("You cannot change the Project of the sprint once it has tasks.")
+            if sprint.state in ("active", "done"):
+                raise ValidationError("You cannot change the Project of the sprint once it is Active or Done.")
+    
+    # When sprint end_date changes, snap non-manual task deadlines to end_date
+    def _sync_auto_task_deadlines_to_end(self):
+        
+        for sprint in self:
+            if not sprint.end_date:
+                continue
+            tasks_to_update = sprint.task_ids.filtered(lambda t: not t.deadline_manual)
+            if tasks_to_update:
+                tasks_to_update.with_context(auto_deadline_sync=True).write({
+                    "date_deadline": sprint.end_date,
+                    "deadline_manual": False,
+                })
+    
+    # If UI didn't send end_date_manual on write, infer it from current values
+    def _infer_end_date_manual_if_missing(self):
+        for sprint in self:
+            if sprint.start_date and sprint.end_date:
+                default_end = self._default_end_date(sprint.start_date)
+                sprint.end_date_manual = (sprint.end_date != default_end)
+        
+    # Block deadline changes if any manual task deadline would be out of the sprint's window
+    def _validate_task_deadlines_within_sprint(self):
+        for sprint in self:
+            if not sprint.start_date or not sprint.end_date:
+                continue
+
+            invalid = sprint.task_ids.filtered(lambda t:
+                t.deadline_manual and t.date_deadline and (
+                    t.date_deadline < sprint.start_date or t.date_deadline > sprint.end_date
+                )
+            )
+
+            if invalid:
+                sample = ", ".join(invalid[:5].mapped("name"))
+                more = "" if len(invalid) <= 5 else f" (+{len(invalid) - 5} more)"
+                raise ValidationError(_(
+                "You cannot change the sprint dates because some tasks have "
+                "manually set deadlines outside the sprint period.\n\n"
+                "Sprint: %(s)s → %(e)s\n"
+                "Tasks: %(sample)s%(more)s\n\n"
+                "Update those task deadlines or remove them from the sprint.",
+                s=sprint.start_date,
+                e=sprint.end_date,
+                sample=sample,
+                more=more
+            ))
+    
+    # -------------------------------------------------------------------------
+    # Compute / inverse
+    # -------------------------------------------------------------------------   
+
+    def _compute_has_tasks(self):
+        for s in self:
+            s.has_tasks = bool(s.task_ids)
+
+    #    When the task form opens, this method ensures the 'Selection' field 
+    #    shows all tasks currently linked to the selected sprint's project.
     def _compute_task_select_ids(self):
         for sprint in self:
             sprint.task_select_ids = sprint.task_ids
 
-    """
-        This method runs when the user modifies task_select_ids in the UI.
 
-        When the user changes the selection, update the real task-sprint relationship
-        Odoo can call this for multiple records at once through the loop
-    """
+    # This method runs when the user modifies task_select_ids in the UI.
+    # When the user changes the selection, update the real task-sprint relationship
+    # Odoo can call this for multiple records at once through the loop
     def _inverse_task_select_ids(self):
-        
         for sprint in self:
-            # A project is required to be assigned if user is creating tasks
             if not sprint.project_id:
                 raise ValidationError("Please select a Project before adding tasks to the sprint.")
-    
+
             to_add = sprint.task_select_ids - sprint.task_ids
             to_remove = sprint.task_ids - sprint.task_select_ids
 
@@ -89,8 +179,10 @@ class ProjectSprint(models.Model):
             if mismatched:
                 raise ValidationError("You can only add tasks from the project assigned to the sprint.")
 
-            to_add.write({"sprint_id": sprint.id})
-            to_remove.write({"sprint_id": False})
+            if to_add:
+                to_add.write({"sprint_id": sprint.id})
+            if to_remove:
+                to_remove.write({"sprint_id": False})
 
             auto_tasks = to_add.filtered(lambda t: not t.deadline_manual and sprint.end_date)
             if auto_tasks:
@@ -98,11 +190,47 @@ class ProjectSprint(models.Model):
                     "date_deadline": sprint.end_date,
                     "deadline_manual": False,
                 })
+    
+    # -------------------------------------------------------------------------
+    # UI onchanges
+    # -------------------------------------------------------------------------
 
-    """
-        Verifies if the tasks being assigned to the sprint are contained in the selected sprint's project
-        If not, sends a validation error
-    """
+    #  Sprint duration rules: Setting a fixed length of two weeks (14 days) for each sprint
+    @api.onchange("start_date")
+    def _onchange_start_date_set_default_end(self):
+        for sprint in self:
+            if not sprint.start_date:
+                continue
+
+            default_end = self._default_end_date(sprint.start_date)
+
+            # Only auto-set end date if it's empty OR still auto-managed
+            if not sprint.end_date or not sprint.end_date_manual:
+                sprint.end_date = default_end
+                sprint.end_date_manual = False
+
+    # sprint end date is set to the default length unless user manually changes it
+    @api.onchange("end_date")
+    def _onchange_end_date_mark_manual(self):
+        for sprint in self:
+            if not sprint.start_date or not sprint.end_date:
+                continue
+
+            default_end = self._default_end_date(sprint.start_date)
+            sprint.end_date_manual = (sprint.end_date != default_end)
+
+    #    Sprint State updates immediately after dates are changed when in state_mode auto
+    @api.onchange("start_date", "end_date", "state_mode", "state_manual")
+    def _onchange_recompute_state(self):
+        for sprint in self:
+            sprint._compute_state()
+
+    # -------------------------------------------------------------------------
+    # Constrains
+    # -------------------------------------------------------------------------
+    
+    #    Verifies if the tasks being assigned to the sprint are contained in the selected sprint's project
+    #    If not, sends a validation error
     @api.constrains("project_id", "task_ids", "state")
     def _check_tasks_match_project(self):
         for sprint in self:
@@ -110,43 +238,59 @@ class ProjectSprint(models.Model):
                 mismatched = sprint.task_ids.filtered(lambda t: t.project_id != sprint.project_id)
                 if mismatched:
                     raise ValidationError("All tasks in the sprint must belong to the assigned project in the same sprint.")
-
-    """
-        Sprint duration rules: Setting a fixed length of two weeks (14 days) for each sprint
-    """
-    @api.onchange("start_date")
-    def _onchange_start_date_set_default_end(self):
-        for sprint in self:
-            # Auto fill end date on first set or keep it synced if still auto-managed
-            if sprint.start_date:
-                sprint.end_date = sprint.start_date + timedelta(days=14)
     
-    """
-        Sprint State updates immediately after dates are changed when in state_mode auto
-    """
-    @api.onchange("start_date", "end_date", "state_mode", "state_manual")
-    def _onchange_recompute_state(self):
-        for sprint in self:
-            sprint._compute_state()
-    
-    """
-        Ensure duration of the sprint does not exceed 28 days
-    """
+    # Ensure Start must be <= End and duration of the sprint does not exceed max set sprint days
     @api.constrains("start_date", "end_date")
     def _check_duration_and_order(self):
-        # Start must be <= End and sprint duration must be at most 4 weeks (28 days)
         for sprint in self:
             if sprint.start_date and sprint.end_date:
                 if sprint.end_date < sprint.start_date:
                     raise ValidationError("Sprint end date cannot be before the start date.")
 
                 duration_days = (sprint.end_date - sprint.start_date).days + 1
-                if duration_days > 28:
-                    raise ValidationError("Sprint duration cannot exceed 4 weeks (28 days).")
+                if duration_days > self.MAX_SPRINT_DAYS:
+                    max_days = self.MAX_SPRINT_DAYS
+                    max_weeks = max_days // 7
+                    raise ValidationError( f"Sprint duration cannot exceed {max_weeks} weeks ({max_days} days)." )
+    
+    # Past date rule for attemps to assigning sprints as planned/active with end dates prior to today
+    @api.constrains("end_date", "state_mode", "state_manual")
+    def _check_no_invalid_past_planned_active_sprint(self):
+        today = fields.Date.context_today(self)
+        for sprint in self:
+            if not sprint.end_date:
+                continue
+
+            if sprint.state_mode == "manual" and sprint.end_date < today and sprint.state_manual in ("planned", "active"):
+                raise ValidationError("A sprint whose end date is in the past cannot be set to Planned or Active.")
+    
+    #   Ensures no sprint assigned to the same project overlaps other by any means
+    @api.constrains("project_id", "start_date", "end_date")
+    def _check_no_overlap_sprints(self):
+        for sprint in self:
+            if not sprint.project_id or not sprint.start_date or not sprint.end_date:
+                continue
+
+            overlapping = self.search([
+                ("project_id", "=", sprint.project_id.id),
+                ("id", "!=", sprint.id),
+                ("start_date", "<=", sprint.end_date),
+                ("end_date", ">=", sprint.start_date),
+            ], limit=1)
+
+            if overlapping:
+                raise ValidationError(_(
+                    "This sprint (%(s)s → %(e)s) overlaps with '%(name)s' (%(os)s → %(oe)s). "
+                    "Sprints in the same project cannot overlap.",
+                    s=sprint.start_date, e=sprint.end_date,
+                    name=overlapping.display_name, os=overlapping.start_date, oe=overlapping.end_date
+                ))
+    
+    # -------------------------------------------------------------------------
+    # State compute + cron + actions
+    # -------------------------------------------------------------------------
                 
-    """
-        auto modifies sprint state according to the start and end date set by the user    
-    """
+    #    auto modifies sprint state according to the start and end date set by the user
     @api.depends("start_date", "end_date", "state_mode", "state_manual")
     def _compute_state(self):
         today = fields.Date.context_today(self)
@@ -182,44 +326,6 @@ class ProjectSprint(models.Model):
 
         if sprints:
             sprints._compute_state()
-    
-    """ 
-        Past date rule for attemps to assigning sprints as planned/active with end dates prior to today
-        Verificar se aqui é necessario validar a start date uma vez que so a end date interessa para a constrain 
-    """
-    @api.constrains("start_date", "end_date", "state_mode", "state_manual")
-    def _check_no_invalid_past_planned_active_sprint(self):
-        today = fields.Date.context_today(self)
-        for sprint in self:
-            if not sprint.start_date or not sprint.end_date:
-                continue
-                
-            if sprint.state_mode == "manual" and sprint.end_date < today and sprint.state_manual in ("planned", "active"):
-                raise ValidationError("A sprint whose end date is in the past cannot be set to Planned or Active.")
-    
-    """
-        Ensures no sprint assigned to the same project overlaps other by any means
-    """
-    @api.constrains("project_id", "start_date", "end_date")
-    def _check_no_overlap_sprints(self):
-        for sprint in self:
-            if not sprint.project_id or not sprint.start_date or not sprint.end_date:
-                continue
-
-            overlapping = self.search([
-                ("project_id", "=", sprint.project_id.id),
-                ("id", "!=", sprint.id),
-                ("start_date", "<=", sprint.end_date),
-                ("end_date", ">=", sprint.start_date),
-            ], limit=1)
-
-            if overlapping:
-                raise ValidationError(_(
-                    "This sprint (%(s)s → %(e)s) overlaps with '%(name)s' (%(os)s → %(oe)s). "
-                    "Sprints in the same project cannot overlap.",
-                    s=sprint.start_date, e=sprint.end_date,
-                    name=overlapping.display_name, os=overlapping.start_date, oe=overlapping.end_date
-                ))
                 
     """
         Button actions to manually override the state of the sprint
@@ -241,29 +347,30 @@ class ProjectSprint(models.Model):
         self.write({"state_mode": "manual", "state_manual": "done"})
         return True
 
-    def _validate_task_deadlines_within_sprint(self):
-        for sprint in self:
-            if not sprint.start_date or not sprint.end_date:
+    # -------------------------------------------------------------------------
+    # ORM overrides
+    # -------------------------------------------------------------------------
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        for vals in vals_list:
+            start = vals.get("start_date")
+            if not start:
                 continue
 
-            invalid = sprint.task_ids.filtered(lambda t:
-                t.date_deadline and (
-                    (sprint.start_date and t.date_deadline < sprint.start_date) or
-                    (sprint.end_date and t.date_deadline > sprint.end_date)
-                )
-            )
+            default_end = self._default_end_str(start)
+            end = vals.get("end_date")
+            manual = vals.get("end_date_manual")
 
-            if invalid:
-                sample = ", ".join(invalid[:5].mapped("name"))
-                more = "" if len(invalid) <= 5 else f" (+{len(invalid) - 5} more)"
-                raise ValidationError(_(
-                    "You cannot change the sprint dates because some task deadlines would be outside the sprint period.\n\n"
-                    "   Sprint: %(s)s → %(e)s\n"
-                    "   Examples: %(sample)s%(more)s\n\n"
-                    "Fix: adjust those task deadlines first, or remove the tasks from the sprint.",
-                    s=sprint.start_date, e=sprint.end_date,
-                    sample=sample, more=more
-                ))
+            # If end not provided, auto-fill and keep manual False
+            if not end:
+                vals.update({"end_date": default_end, "end_date_manual": False})
+            elif manual is None:
+                end_str = fields.Date.to_string(end) if not isinstance(end, str) else end
+                vals["end_date_manual"] = (end_str != default_end)
+                    
+        return super().create(vals_list)
+
     
     """
         Overriding write function as UI rules are not guarantees in Odoo. Therefore, It is created a business rule enforcement:
@@ -272,17 +379,30 @@ class ProjectSprint(models.Model):
             This rule is being enforced at the Object-Relational Mapping (ORM) level to ensure data integrity across all entry points.
     """
     def write(self, vals):
-        # Keep your existing "project_id cannot change" rule
-        if "project_id" in vals:
-            Task = self.env["project.task"]
-            for sprint in self:
-                has_tasks = Task.search_count([("sprint_id", "=", sprint.id)]) > 0
-                if has_tasks:
-                    raise ValidationError("You cannot change the Project of the sprint once it has tasks.")
-                if sprint.state in ("active", "done"):
-                    raise ValidationError("You cannot change the Project of the sprint once it is Active or Done.")
+        self._enforce_project_lock(vals)
 
         changing_dates = ("start_date" in vals) or ("end_date" in vals)
+
+        # start_date changed and end_date not manually changed -> auto shift
+        if "start_date" in vals and "end_date" not in vals and vals.get("start_date"):
+            new_start = vals["start_date"]
+            new_default_end = self._default_end_str(new_start)
+
+            # Write per record to respect each sprint's manual flag
+            ok = True
+            for sprint in self:
+                if sprint.end_date_manual:
+                    ok = ok and super(ProjectSprint, sprint).write({"start_date": new_start})
+                else:
+                    ok = ok and super(ProjectSprint, sprint).write({
+                        "start_date": new_start,
+                        "end_date": new_default_end,
+                        "end_date_manual": False,
+                    })
+
+            # Validate after write (rollback on error)
+            self._validate_task_deadlines_within_sprint()
+            return ok
         
         res = super().write(vals)
 
@@ -290,15 +410,10 @@ class ProjectSprint(models.Model):
         if changing_dates:
             self._validate_task_deadlines_within_sprint()
 
+        # If end_date changed explicitly, update non-manual task deadlines
         if "end_date" in vals:
-            for sprint in self:
-                if not sprint.end_date:
-                    continue
-                tasks_to_update = sprint.task_ids.filtered(lambda t: not t.deadline_manual)
-                if tasks_to_update and sprint.end_date:
-                    tasks_to_update.with_context(auto_deadline_sync=True).write({
-                        "date_deadline": sprint.end_date,
-                        "deadline_manual": False,
-                    })
+            self._sync_auto_task_deadlines_to_end()
+            if "end_date_manual" not in vals:
+                self._infer_end_date_manual_if_missing()
 
         return res

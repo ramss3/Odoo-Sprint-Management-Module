@@ -19,17 +19,15 @@ class ProjectTask(models.Model):
     # If user manually changes date_deadline the deadline_manual becomes true
     deadline_manual = fields.Boolean(default=False)
 
-    # Helper to hold the sprint's deadline
-    sprint_default_deadline = fields.Date(
-        compute="_compute_sprint_default_deadline",
-        store=False,
-    )
+    # -------------------------------------------------------------------------
+    # UI helpers
+    # -------------------------------------------------------------------------
 
     @api.onchange("name", "sprint_id", "project_id")
     def _onchange_warn_duplicate_task_name_in_sprint(self):
         for task in self:
             name = (task.name or "").strip()
-            if not name:
+            if not name or not task.sprint_id:
                 continue
 
             duplicates_in_sprint = [
@@ -40,14 +38,8 @@ class ProjectTask(models.Model):
             # Only exclude itself if it has a real DB id (int)
             if isinstance(task.id, int):
                 duplicates_in_sprint.append(("id", "!=", task.id))
-
-            # Only warn if sprint is set
-            if not task.sprint_id:
-                continue
-
-            dup_count = self.env["project.task"].search_count(duplicates_in_sprint)
             
-            if dup_count:
+            if self.env["project.task"].search_count(duplicates_in_sprint):
                 return {
                     "warning": {
                         "title": _("Possible duplicate task name"),
@@ -58,11 +50,26 @@ class ProjectTask(models.Model):
                         ),
                     }
                 }
-
-    @api.depends("sprint_id", "sprint_id.end_date")
-    def _compute_sprint_default_deadline(self):
+    
+    # when sprint changes, auto-set deadline unless user has manually pinned it
+    @api.onchange("sprint_id")
+    def _onchange_sprint_id(self):
         for task in self:
-            task.sprint_default_deadline = task.sprint_id.end_date if task.sprint_id else False
+            if task.sprint_id and task.sprint_id.end_date:
+                task.date_deadline = task.sprint_id.end_date
+                task.deadline_manual = False
+    
+    # If user edits task date_deadline, mark as manual
+    @api.onchange("date_deadline")
+    def _onchange_date_deadline_mark_manual(self):
+        for task in self:
+            if not task.sprint_id:
+                continue
+            task.deadline_manual = (task.date_deadline != task.sprint_id.end_date)
+    
+    # -------------------------------------------------------------------------
+    # Business rules (ORM)
+    # -------------------------------------------------------------------------
 
     @api.constrains("sprint_id", "date_deadline", "project_id")
     def _check_sprint_deadline_and_project(self):
@@ -93,28 +100,6 @@ class ProjectTask(models.Model):
                     f"Please set a deadline on or before the sprint's end date ({task.sprint_id.end_date})."
                 )
             
-    # UI: when sprint changes, auto-set deadline unless user has manually pinned it
-    @api.onchange("sprint_id")
-    def _onchange_sprint_id(self):
-        for task in self:
-            if not task.sprint_id:
-                continue
-            if task.sprint_id.end_date and (not task.deadline_manual or not task.date_deadline):
-                task.date_deadline = task.sprint_id.end_date
-                task.deadline_manual = False
-    
-    # UI: if user edits date_deadline away from sprint default, mark as manual
-    @api.onchange("date_deadline", "sprint_id")
-    def _onchange_date_deadline_mark_manual(self):
-        for task in self:
-            if not task.sprint_id:
-                continue
-            default = task.sprint_default_deadline
-            # If user changed it (including clearing it), treat as manual override
-            if task.date_deadline != default:
-                task.deadline_manual = True
-            else:
-                task.deadline_manual = False
     
     @api.model_create_multi
     def create(self, vals_list):
@@ -128,49 +113,41 @@ class ProjectTask(models.Model):
             if not sprint.exists():
                 continue
 
-            provided_deadline = vals.get("date_deadline")
-
-            # If no deadline provided, inherit sprint end_date and mark as auto
-            if not provided_deadline and sprint.end_date:
+            if not vals.get("date_deadline"):
                 vals["date_deadline"] = sprint.end_date
                 vals["deadline_manual"] = False
-                continue
-
-            # If deadline provided, manual unless it matches sprint end_date
-            if provided_deadline and sprint.end_date and provided_deadline == sprint.end_date:
-                vals["deadline_manual"] = False
-            elif provided_deadline:
-                vals["deadline_manual"] = True
+            else:
+                vals["deadline_manual"] = (vals["date_deadline"] != sprint.end_date)
 
         return super().create(vals_list)
 
     def write(self, vals):
         auto_sync = self.env.context.get("auto_deadline_sync")
 
-        res = super().write(vals)
-
-        # If sprint changed, keep deadline if in bounds, else snap to sprint end_date
+        # Handle sprint moves before super().write() (constraints)
         if (not auto_sync) and ("sprint_id" in vals):
+            Sprint = self.env["project.sprint"]
+            new_sprint = Sprint.browse(vals["sprint_id"]) if vals.get("sprint_id") else Sprint
+        
+            ok = True
             for task in self:
-                if not task.sprint_id or not task.sprint_id.end_date:
+                v = dict(vals)
+
+                # If removing sprint, just write normally (constraint will skip)
+                if not v.get("sprint_id"):
+                    ok = ok and super(ProjectTask, task).write(v)
                     continue
 
-                sprint = task.sprint_id
-                deadline = task.date_deadline
+                # Force sprint end date as deadline and reset manual flag (always)
+                if new_sprint.end_date:
+                    v["date_deadline"] = new_sprint.end_date
+                    v["deadline_manual"] = False
 
-                out_of_bound = (
-                    not deadline or
-                    (sprint.start_date and deadline < sprint.start_date) or
-                    (sprint.end_date and deadline > sprint.end_date)
-                )
+                ok = ok and super(ProjectTask, task).write(v)
 
-                if out_of_bound:
-                    task.with_context(auto_deadline_sync=True).write({
-                        "date_deadline": sprint.end_date,
-                        "deadline_manual": False,
-                    })
+            return ok
 
-        # Only determine manual flag for real user writes (not our sync writes)
+        # if user updates date_deadline, set manual flag in the same write
         if not auto_sync:
             # If either sprint_id or date_deadline changed, re-evaluate manual flag
             if "sprint_id" in vals or "date_deadline" in vals:
@@ -184,4 +161,4 @@ class ProjectTask(models.Model):
                         if not task.deadline_manual:
                             task.with_context(auto_deadline_sync=True).write({"deadline_manual": True})
 
-        return res
+        return super().write(vals)
